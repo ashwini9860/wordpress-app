@@ -1,5 +1,15 @@
+terraform {
+  backend "s3" {
+    #Be sure to match an S3 Bucket you have already created!
+    bucket = "terraform-wordpress"
+    region = "ap-south-1"
+    key    = "wordpress-app.tfstate"
+  }
+}
+
+#######Providers#############
 provider "aws" {
-  region = "ap-south-1"
+  region = var.AWS_REGION_NAME
 }
 
 #####
@@ -98,10 +108,10 @@ module "fargate" {
 
   platform_version = "1.4.0"
 
-  task_container_image   = "auchoudhari/wordpress-test:latest"
-  task_definition_cpu    = 256
-  task_definition_memory = 512
-
+  task_container_image            = "auchoudhari/wordpress-test:latest"
+  task_definition_cpu             = 256
+  task_definition_memory          = 512
+  environment                     = var.environment
   task_container_port             = 80
   task_container_assign_public_ip = true
 
