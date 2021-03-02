@@ -114,7 +114,7 @@ module "fargate" {
   environment                     = var.environment
   task_container_port             = 80
   task_container_assign_public_ip = true
-
+  
   target_groups = [
     {
       target_group_name = "efs-example"
