@@ -1,162 +1,205 @@
-terraform {
-  backend "s3" {
-    #Be sure to match an S3 Bucket you have already created!
-    bucket = "terraform-wordpress"
-    region = "ap-south-1"
-    key    = "wordpress-app.tfstate"
-  }
-}
+#terraform {
+#  backend "s3" {
+#    #Be sure to match an S3 Bucket you have already created!
+#    bucket = "terraform-wordpress"
+#    region = "ap-south-1"
+#    key    = "wordpress-app.tfstate"
+#  }
+#}
 
 #######Providers#############
 provider "aws" {
   region = var.AWS_REGION_NAME
 }
 
-#####
-# VPC and subnets
-#####
-data "aws_vpc" "default" {
-  default = true
+data "aws_iam_role" "task" {
+  name = var.task_role
 }
 
-data "aws_subnet_ids" "all" {
-  vpc_id = data.aws_vpc.default.id
+#####Create IAM role###########
+resource "aws_iam_role" "deployment_access_role" {
+  name               = "fargate_role"
+  assume_role_policy = "${file("../scripts/assumerolepolicy.json")}"
+  tags = {
+    Name = "fargate_role"
+  }
+
 }
 
-#####
-# ALB
-#####
-module "alb" {
-  source  = "umotif-public/alb/aws"
-  version = "~> 2.0"
-
-  name_prefix        = "alb-example"
-  load_balancer_type = "application"
-  internal           = false
-  vpc_id             = data.aws_vpc.default.id
-  subnets            = data.aws_subnet_ids.all.ids
+#######Create IAM Policy#######
+resource "aws_iam_policy" "policy" {
+  name        = "fargate-policy"
+  description = "a policy for deployment server"
+  policy      = "${file("../scripts/ecs.json")}"
 }
 
-resource "aws_lb_listener" "alb_80" {
-  load_balancer_arn = module.alb.arn
-  port              = "80"
-  protocol          = "HTTP"
+#######Attaching policy to role##########
+resource "aws_iam_policy_attachment" "deployment-attach" {
+  name       = "fargate-attachment"
+  roles      = ["${aws_iam_role.deployment_access_role.name}"]
+  policy_arn = "${aws_iam_policy.policy.arn}"
+}
 
-  default_action {
-    type             = "forward"
-    target_group_arn = module.fargate.target_group_arn[0]
+
+
+######## Create VPC ############
+resource "aws_vpc" "vpc" {
+  cidr_block           = "${var.VPC_CIDR_BLOCK}"
+  enable_dns_support   = "true"
+  enable_dns_hostnames = "true"
+  instance_tenancy     = "default"
+  enable_classiclink   = "false"
+  tags = {
+    Name = "${var.project}_VPC"
+  }
+
+}
+#############Create IGW######################
+resource "aws_internet_gateway" "igw" {
+  vpc_id = "${aws_vpc.vpc.id}"
+  tags = {
+    Name = "${var.project}_IGW"
+  }
+
+
+}
+
+
+############CReate public subnet######
+resource "aws_subnet" "public_subnet" {
+  count                   = "${length(var.AVAILABILITY_ZONE)}"
+  vpc_id                  = "${aws_vpc.vpc.id}"
+  cidr_block              = "${cidrsubnet(var.VPC_CIDR_BLOCK, 8, count.index)}"
+  map_public_ip_on_launch = "true"
+  availability_zone       = "${element(var.AVAILABILITY_ZONE, count.index)}"
+  tags = {
+    Name = "${var.project}_PUB${count.index}"
+  }
+
+}
+
+
+##########Create public RT#####
+resource "aws_route_table" "public-rt" {
+  vpc_id = "${aws_vpc.vpc.id}"
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = "${aws_internet_gateway.igw.id}"
+  }
+  tags = {
+    Name = "${var.project}_RT"
   }
 }
 
-#####
-# Security Group Config
-#####
-resource "aws_security_group_rule" "alb_ingress_80" {
-  security_group_id = module.alb.security_group_id
-  type              = "ingress"
-  protocol          = "tcp"
-  from_port         = 80
-  to_port           = 80
-  cidr_blocks       = ["0.0.0.0/0"]
-  ipv6_cidr_blocks  = ["::/0"]
+##############Create Public Route table Association #####################
+resource "aws_route_table_association" "public-rt-association" {
+  count          = "${length(var.AVAILABILITY_ZONE)}"
+  subnet_id      = "${element(aws_subnet.public_subnet.*.id, count.index)}"
+  route_table_id = "${aws_route_table.public-rt.id}"
 }
 
-resource "aws_security_group_rule" "task_ingress_80" {
-  security_group_id        = module.fargate.service_sg_id
-  type                     = "ingress"
-  protocol                 = "tcp"
-  from_port                = 80
-  to_port                  = 80
-  source_security_group_id = module.alb.security_group_id
-}
-
-#####
-# EFS
-#####
+########### create efs #######
 resource "aws_efs_file_system" "efs" {
-  creation_token = "efs-html"
+  creation_token = "clever"
 
   tags = {
-    Name = "efs-html"
+    Name = "${var.project}_EFS"
   }
 }
 
-#####
-# ECS cluster and fargate
-#####
-resource "aws_ecs_cluster" "cluster" {
-  name               = "wordpress-app"
-  capacity_providers = ["FARGATE_SPOT", "FARGATE"]
+######## create ecs cluster #######
+resource "aws_ecs_cluster" "ecs_cluster" {
+  name = "${var.project}_ecs"
+}
 
-  default_capacity_provider_strategy {
-    capacity_provider = "FARGATE_SPOT"
-  }
+########## 
+resource "aws_ecs_task_definition" "clever_task" {
+  family                   = "test"
+  task_role_arn            = aws_iam_role.deployment_access_role.arn
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "0.25vCPU"
+  memory                   = "0.5GB"
+  network_mode             = "awsvpc"
+  container_definitions    = <<TASK_DEFINITION
+[
+    {
+        
+        "environment": [
+            {"name": "WORDPRESS_DB_PASSWORD", "value": "wordpress"},
+            {"name": "WORDPRESS_DB_USER", "value": "wordpress"},
+            {"name": "WORDPRESS_DB_NAME", "value": "wordpress"},
+            {"name": "WORDPRESS_DB_HOST", "value": "db:3306"}
+        ],
+        "essential": true,
+        "image": "auchoudhari/wordpress-testlatest",
+        "name": "app",
+        "memory": 128,
+        "portMappings": [
+            {
+                "containerPort": 80
+            }
+        ]
+        
+    }
+]
+TASK_DEFINITION
 
-  setting {
-    name  = "containerInsights"
-    value = "disabled"
+  volume {
+    name = "${var.project}-storage"
+
+    efs_volume_configuration {
+      file_system_id = aws_efs_file_system.efs.id
+      root_directory = "/wp-content/uploads/"
+    }
   }
 }
 
-module "fargate" {
-  source = "../../"
+########### SG ########################
+resource "aws_security_group" "dynamic_sg" {
+  name        = "${var.project}_sg"
+  description = "clever sg"
+  vpc_id      = aws_vpc.vpc.id
+  egress {
+    from_port   = "0"
+    to_port     = "0"
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  dynamic "ingress" {
+    iterator = port
+    for_each = var.ingress_ports
+    content {
+      from_port   = port.value
+      to_port     = port.value
+      protocol    = var.ingress_protocol
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
 
-  name_prefix        = "ecs-fargate-wordpress"
-  vpc_id             = data.aws_vpc.default.id
-  private_subnet_ids = data.aws_subnet_ids.all.ids
-  cluster_id         = aws_ecs_cluster.cluster.id
+  tags = {
+    Name = "${var.project}_sg"
+  }
 
+
+}
+
+data "aws_ecs_task_definition" "main" {
+  task_definition = aws_ecs_task_definition.clever_task.family
+}
+
+#####
+resource "aws_ecs_service" "service" {
+  name             = "test"
+  cluster          = aws_ecs_cluster.ecs_cluster.id
+  task_definition  = aws_ecs_task_definition.clever_task.family
+  desired_count    = 1
   platform_version = "1.4.0"
-
-  task_container_image            = "auchoudhari/wordpress-test:latest"
-  task_definition_cpu             = 256
-  task_definition_memory          = 512
-  environment                     = var.environment
-  task_container_port             = 80
-  task_container_assign_public_ip = true
-  
-  target_groups = [
-    {
-      target_group_name = "efs-example"
-      container_port    = 80
-    }
-  ]
-
-  health_check = {
-    port = "traffic-port"
-    path = "/"
+  launch_type      = "FARGATE"
+  network_configuration {
+    security_groups  = [aws_security_group.dynamic_sg.id]
+    subnets          = [aws_subnet.public_subnet[0].id, aws_subnet.public_subnet[1].id, aws_subnet.public_subnet[2].id]
+    assign_public_ip = "true"
   }
 
-  capacity_provider_strategy = [
-    {
-      capacity_provider = "FARGATE_SPOT",
-      weight            = 100
-    }
-  ]
-
-  task_stop_timeout = 90
-
-  task_mount_points = [
-    {
-      "sourceVolume"  = aws_efs_file_system.efs.creation_token,
-      "containerPath" = "/wp-content/uploads/",
-      "readOnly"      = true
-    }
-  ]
-
-  volume = [
-    {
-      name = "efs-html",
-      efs_volume_configuration = [
-        {
-          "file_system_id" : aws_efs_file_system.efs.id,
-          "root_directory" : "/wp-content/uploads/"
-        }
-      ]
-    }
-  ]
-
-  depends_on = [
-    module.alb
-  ]
 }
+
